@@ -1,0 +1,279 @@
+# Project Structure
+# vitaai/
+#   ├── manage.py
+#   ├── requirements.txt
+#   ├── vitaai/
+#   │   ├── __init__.py
+#   │   ├── settings.py
+#   │   ├── urls.py
+#   │   └── wsgi.py
+#   └── diagnosis/
+#       ├── __init__.py
+#       ├── models.py
+#       ├── serializers.py
+#       ├── views.py
+#       ├── ml_models/
+#       │   ├── __init__.py
+#       │   ├── symptom_model.py
+#       │   └── image_model.py
+#       └── tests.py
+
+# requirements.txt
+"""
+Django==5.0.1
+djangorestframework==3.14.0
+psycopg2-binary==2.9.9
+Pillow==10.2.0
+numpy==1.26.3
+pandas==2.2.0
+scikit-learn==1.4.0
+tensorflow==2.15.0
+opencv-python==4.9.0.80
+python-dotenv==1.0.0
+jwt==1.3.1
+"""
+
+# diagnosis/models.py
+from django.db import models
+from django.contrib.auth.models import User
+from django.contrib.postgres.fields import JSONField
+
+class Symptom(models.Model):
+    name = models.CharField(max_length=100)
+    description = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+class MedicalImage(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    image = models.ImageField(upload_to='medical_images/')
+    image_type = models.CharField(max_length=50)  # e.g., 'xray', 'mri', 'dermatological'
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.user.username}'s {self.image_type} image"
+
+class DiagnosticHistory(models.Model):
+    DIAGNOSIS_TYPES = (
+        ('symptom', 'Symptom-based'),
+        ('image', 'Image-based'),
+    )
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    diagnosis_type = models.CharField(max_length=10, choices=DIAGNOSIS_TYPES)
+    symptoms = models.ManyToManyField(Symptom, blank=True)
+    medical_image = models.ForeignKey(MedicalImage, on_delete=models.SET_NULL, null=True, blank=True)
+    predicted_conditions = JSONField()  # Store predicted conditions and their confidence scores
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.user.username}'s diagnosis on {self.created_at}"
+
+# diagnosis/serializers.py
+from rest_framework import serializers
+from .models import Symptom, MedicalImage, DiagnosticHistory
+
+class SymptomSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Symptom
+        fields = '__all__'
+
+class MedicalImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MedicalImage
+        fields = ['id', 'image', 'image_type', 'uploaded_at']
+
+class DiagnosticHistorySerializer(serializers.ModelSerializer):
+    symptoms = SymptomSerializer(many=True, read_only=True)
+    medical_image = MedicalImageSerializer(read_only=True)
+
+    class Meta:
+        model = DiagnosticHistory
+        fields = '__all__'
+
+# diagnosis/ml_models/symptom_model.py
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+import joblib
+
+class SymptomBasedModel:
+    def __init__(self):
+        self.model = None
+        self.symptom_encoder = None
+        self.disease_encoder = None
+        self.load_model()
+
+    def load_model(self):
+        # Load the trained model and encoders
+        try:
+            self.model = joblib.load('models/symptom_model.pkl')
+            self.symptom_encoder = joblib.load('models/symptom_encoder.pkl')
+            self.disease_encoder = joblib.load('models/disease_encoder.pkl')
+        except FileNotFoundError:
+            # Initialize new model if not found
+            self.model = RandomForestClassifier()
+
+    def predict(self, symptoms):
+        # Encode symptoms and make prediction
+        encoded_symptoms = self.symptom_encoder.transform([symptoms])
+        predictions = self.model.predict_proba(encoded_symptoms)
+        
+        # Get top 3 predictions with confidence scores
+        top_indices = np.argsort(predictions[0])[-3:][::-1]
+        results = {
+            self.disease_encoder.inverse_transform([idx])[0]: float(predictions[0][idx])
+            for idx in top_indices
+        }
+        
+        return results
+
+# diagnosis/ml_models/image_model.py
+import tensorflow as tf
+import cv2
+import numpy as np
+
+class ImageBasedModel:
+    def __init__(self):
+        self.model = None
+        self.load_model()
+
+    def load_model(self):
+        try:
+            self.model = tf.keras.models.load_model('models/image_model.h5')
+        except:
+            # Initialize base model if not found
+            self.model = self._create_base_model()
+
+    def _create_base_model(self):
+        # Create a simple CNN model
+        model = tf.keras.Sequential([
+            tf.keras.layers.Conv2D(32, 3, activation='relu', input_shape=(224, 224, 3)),
+            tf.keras.layers.MaxPooling2D(),
+            tf.keras.layers.Conv2D(64, 3, activation='relu'),
+            tf.keras.layers.MaxPooling2D(),
+            tf.keras.layers.Conv2D(64, 3, activation='relu'),
+            tf.keras.layers.Flatten(),
+            tf.keras.layers.Dense(64, activation='relu'),
+            tf.keras.layers.Dense(10, activation='softmax')
+        ])
+        model.compile(optimizer='adam',
+                     loss='categorical_crossentropy',
+                     metrics=['accuracy'])
+        return model
+
+    def preprocess_image(self, image_path):
+        # Load and preprocess image
+        img = cv2.imread(image_path)
+        img = cv2.resize(img, (224, 224))
+        img = img / 255.0
+        return np.expand_dims(img, axis=0)
+
+    def predict(self, image_path):
+        # Preprocess image and make prediction
+        processed_image = self.preprocess_image(image_path)
+        predictions = self.model.predict(processed_image)
+        
+        # Get top 3 predictions with confidence scores
+        top_indices = np.argsort(predictions[0])[-3:][::-1]
+        results = {
+            f"condition_{idx}": float(predictions[0][idx])
+            for idx in top_indices
+        }
+        
+        return results
+
+# diagnosis/views.py
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from .models import Symptom, MedicalImage, DiagnosticHistory
+from .serializers import (
+    SymptomSerializer, MedicalImageSerializer, DiagnosticHistorySerializer
+)
+from .ml_models.symptom_model import SymptomBasedModel
+from .ml_models.image_model import ImageBasedModel
+
+class DiagnosisViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    serializer_class = DiagnosticHistorySerializer
+    
+    def get_queryset(self):
+        return DiagnosticHistory.objects.filter(user=self.request.user)
+
+    @action(detail=False, methods=['post'])
+    def symptom_diagnosis(self, request):
+        symptoms = request.data.get('symptoms', [])
+        
+        # Validate symptoms
+        if not symptoms:
+            return Response(
+                {'error': 'No symptoms provided'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Get predictions from the symptom model
+        symptom_model = SymptomBasedModel()
+        predictions = symptom_model.predict(symptoms)
+
+        # Create diagnostic history
+        diagnosis = DiagnosticHistory.objects.create(
+            user=request.user,
+            diagnosis_type='symptom',
+            predicted_conditions=predictions
+        )
+        diagnosis.symptoms.set(Symptom.objects.filter(name__in=symptoms))
+
+        serializer = self.get_serializer(diagnosis)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def image_diagnosis(self, request):
+        image = request.FILES.get('image')
+        image_type = request.data.get('image_type')
+
+        # Validate input
+        if not image or not image_type:
+            return Response(
+                {'error': 'Image and image type are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Save medical image
+        medical_image = MedicalImage.objects.create(
+            user=request.user,
+            image=image,
+            image_type=image_type
+        )
+
+        # Get predictions from the image model
+        image_model = ImageBasedModel()
+        predictions = image_model.predict(medical_image.image.path)
+
+        # Create diagnostic history
+        diagnosis = DiagnosticHistory.objects.create(
+            user=request.user,
+            diagnosis_type='image',
+            medical_image=medical_image,
+            predicted_conditions=predictions
+        )
+
+        serializer = self.get_serializer(diagnosis)
+        return Response(serializer.data)
+
+# vitaai/urls.py
+from django.contrib import admin
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from diagnosis.views import DiagnosisViewSet
+
+router = DefaultRouter()
+router.register(r'diagnosis', DiagnosisViewSet, basename='diagnosis')
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('api/', include(router.urls)),
+]
